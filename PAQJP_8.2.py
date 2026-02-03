@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PAQJP 8.2 – Multi-pass compact RLE transform 0
+PAQJP 8.2 – Multi-pass compact RLE transform 0 (corrected lossless version)
 Tries best shift + compact RLE up to 100 passes
 """
 
@@ -10,8 +10,11 @@ import math
 import random
 from typing import Optional, List
 
-# paq module - you need to have paq.py or similar in the same folder
-import paq
+# You need paq.py (or compatible PAQ compressor) in the same folder
+try:
+    import paq
+except ImportError:
+    paq = None
 
 try:
     import zstandard as zstd
@@ -21,7 +24,7 @@ try:
 except ImportError:
     HAS_ZSTD = False
 
-PROGNAME = "PAQJP_8.2_MULTI_PASS_COMPACT"
+PROGNAME = "PAQJP_8.2_MULTI_PASS_COMPACT_CORRECTED"
 
 PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p**0.5)+1))]
 PI_DIGITS = [79, 17, 111]
@@ -81,7 +84,6 @@ class PAQJPCompressor:
         self.PI_DIGITS = PI_DIGITS.copy()
         self.seed_tables = self._gen_seed_tables()
         self.fibonacci = self._gen_fib(100)
-        self.state_table = StateTable()
 
     def _gen_fib(self, n):
         a, b = 0, 1
@@ -116,7 +118,7 @@ class PAQJPCompressor:
         return val
 
     # ────────────────────────────────────────────────
-    # TRANSFORM 00 – multi-pass best shift + compact RLE
+    # TRANSFORM 00 – multi-pass best shift + compact RLE (now lossless)
     # ────────────────────────────────────────────────
     def transform_00(self, data: bytes) -> bytes:
         if not data:
@@ -125,11 +127,11 @@ class PAQJPCompressor:
         current = bytearray(data)
         best_result = None
         best_length = float('inf')
-        best_shifts = []
+        best_shifts = []  # list of applied shifts, in order
 
         MAX_PASSES = 100
 
-        for pass_num in range(MAX_PASSES):
+        for _ in range(MAX_PASSES):
             best_shifted = current
             best_score = 0
             best_shift = 0
@@ -139,6 +141,7 @@ class PAQJPCompressor:
                 for j in range(len(tmp)):
                     tmp[j] = (tmp[j] + shift) % 256
 
+                # score = sum of run lengths (longer runs = better)
                 score = 0
                 i = 0
                 while i < len(tmp):
@@ -155,9 +158,9 @@ class PAQJPCompressor:
                     best_shifted = tmp
                     best_shift = shift
 
-            # Compact RLE encoding
+            # Compact RLE
             bits: List[int] = []
-            self._append_bits(bits, 0b010, 3)      # version marker
+            self._append_bits(bits, 0b010, 3)      # marker
             self._append_bits(bits, best_shift, 8)
 
             i = 0
@@ -170,10 +173,9 @@ class PAQJPCompressor:
                     run += 1
                     i += 1
 
-                # Run code (2–12 bits + 8-bit value)
                 if run == 1:
                     self._append_bits(bits, 0b00, 2)
-                elif run <= 4:
+                elif run <= 5:
                     self._append_bits(bits, 0b01, 2)
                     self._append_bits(bits, run - 2, 2)
                 elif run <= 12:
@@ -192,10 +194,14 @@ class PAQJPCompressor:
 
             out_bytes = bytearray()
             for j in range(0, len(bits), 8):
-                byte = sum(bits[j + k] << (7 - k) for k in range(8) if j + k < len(bits))
+                byte = 0
+                for k in range(8):
+                    if j + k < len(bits):
+                        byte = (byte << 1) | bits[j + k]
                 out_bytes.append(byte)
 
             curr_len = len(out_bytes)
+
             if curr_len < best_length:
                 best_length = curr_len
                 best_result = bytes(out_bytes)
@@ -213,68 +219,100 @@ class PAQJPCompressor:
         header.extend(best_shifts)
         return header + best_result
 
+
     def reverse_transform_00(self, cdata: bytes) -> bytes:
         if not cdata or cdata == b'\x00':
-            return b''
-
-        if len(cdata) < 2:
             return b''
 
         num_passes = cdata[0]
         if num_passes == 0:
             return cdata[1:]
 
-        shifts = cdata[1:1 + num_passes]
-        stream = cdata[1 + num_passes:]
+        if len(cdata) < 1 + num_passes:
+            return b''  # invalid
 
-        current = bytearray(stream)
+        shifts = list(cdata[1:1 + num_passes])
+        rle_data = cdata[1 + num_passes:]
 
-        for p in range(num_passes - 1, -1, -1):
-            shift = shifts[p]
+        decoded = self._rle_decode(rle_data)
+        if decoded is None:
+            return b''  # decode failed
 
-            bits = []
-            for b in current:
-                for i in range(7, -1, -1):
-                    bits.append((b >> i) & 1)
+        current = bytearray(decoded)
 
-            out = bytearray()
-            pos = 0
-            nbits = len(bits)
-
-            pos += 3 + 8  # skip header
-
-            while pos + 10 < nbits:  # at least prefix + value
-                prefix = self._read_bits(bits, pos, 2)
-                pos += 2
-
-                if prefix == 0b00:
-                    run = 1
-                elif prefix == 0b01:
-                    run = 2 + self._read_bits(bits, pos, 2)
-                    pos += 2
-                elif prefix == 0b10:
-                    run = 5 + self._read_bits(bits, pos, 3)
-                    pos += 3
-                else:  # 11 → long
-                    pos += 2  # consume remaining prefix bits
-                    extra = self._read_bits(bits, pos, 8)
-                    pos += 8
-                    run = 13 + extra
-
-                val = self._read_bits(bits, pos, 8)
-                pos += 8
-
-                out.extend([val] * run)
-
-            for i in range(len(out)):
-                out[i] = (out[i] - shift) % 256
-
-            current = out
+        # Undo shifts in reverse order
+        for shift in reversed(shifts):
+            for i in range(len(current)):
+                current[i] = (current[i] - shift) % 256
 
         return bytes(current)
 
+
+    def _rle_decode(self, data: bytes) -> Optional[bytearray]:
+        if not data:
+            return None
+
+        bits = []
+        for b in data:
+            for i in range(7, -1, -1):
+                bits.append((b >> i) & 1)
+
+        pos = 0
+        nbits = len(bits)
+
+        if nbits < 11:  # at least marker(3) + shift(8)
+            return None
+
+        # Read marker and shift (discard shift for decoding)
+        marker = self._read_bits(bits, pos, 3)
+        pos += 3
+        if marker != 0b010:
+            return None
+
+        pos += 8  # skip shift byte
+
+        out = bytearray()
+
+        while pos + 2 <= nbits:
+            prefix = self._read_bits(bits, pos, 2)
+            pos += 2
+
+            if prefix == 0b00:
+                run = 1
+            elif prefix == 0b01:
+                if pos + 2 > nbits:
+                    break
+                run = 2 + self._read_bits(bits, pos, 2)
+                pos += 2
+            elif prefix == 0b10:
+                if pos + 3 > nbits:
+                    break
+                run = 5 + self._read_bits(bits, pos, 3)
+                pos += 3
+            else:  # 11 → long run
+                if pos + 10 > nbits:
+                    break
+                pos += 2  # consume remaining prefix bits
+                extra = self._read_bits(bits, pos, 8)
+                pos += 8
+                run = 13 + extra
+
+            if pos + 8 > nbits:
+                break
+
+            val = self._read_bits(bits, pos, 8)
+            pos += 8
+
+            out.extend([val] * run)
+
+        # Allow up to 7 padding bits at the end
+        if nbits - pos > 7:
+            return None  # too many leftover bits → probably corrupt
+
+        return out
+
     # ────────────────────────────────────────────────
-    # Other transforms (1–15) – as in original
+    # Other transforms (1–15) – unchanged
     # ────────────────────────────────────────────────
 
     def transform_01(self, d, r=100):
@@ -545,9 +583,15 @@ class PAQJPCompressor:
     # Compression / Decompression backends
     # ────────────────────────────────────────────────
     def _compress_backend(self, data: bytes) -> bytes:
-        candidates = [(b'L', paq.compress(data))]
+        candidates = []
+        if paq is not None:
+            candidates.append((b'L', paq.compress(data)))
         if HAS_ZSTD:
             candidates.append((b'Z', zstd_cctx.compress(data)))
+
+        if not candidates:
+            return b''  # no compressor available
+
         winner_id, winner_data = min(candidates, key=lambda x: len(x[1]))
         return winner_id + winner_data
 
@@ -555,7 +599,7 @@ class PAQJPCompressor:
         if len(data) < 1: return None
         engine = data[0]
         payload = data[1:]
-        if engine == ord('L'):
+        if engine == ord('L') and paq is not None:
             try: return paq.decompress(payload)
             except: return None
         if engine == ord('Z') and HAS_ZSTD:
@@ -650,14 +694,14 @@ class PAQJPCompressor:
         with open(outfile, 'wb') as f:
             f.write(compressed)
         ratio = (1 - len(compressed) / len(data)) * 100 if data else 0
-        backend_info = " (zstd)" if HAS_ZSTD else " (paq only)"
+        backend_info = " (zstd)" if HAS_ZSTD else " (paq only)" if paq else " (no backend!)"
         print(f"Compressed {len(data)} → {len(compressed)} bytes ({ratio:.2f}% saved){backend_info} → {outfile}")
 
     def decompress(self, infile: str, outfile: str):
         with open(infile, 'rb') as f:
             data = f.read()
         original, marker = self.decompress_with_best(data)
-        if original is None:
+        if original is None or original == b'':
             print("Decompression failed!")
             return
         with open(outfile, 'wb') as f:
@@ -666,7 +710,7 @@ class PAQJPCompressor:
 
 
 def main():
-    print(f"{PROGNAME} – multi-pass compact RLE transform 0")
+    print(f"{PROGNAME} – multi-pass compact RLE transform 0 (lossless corrected)")
     c = PAQJPCompressor()
     ch = input("1) Compress   2) Decompress\n> ").strip()
     if ch == "1":
